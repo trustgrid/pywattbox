@@ -21,10 +21,9 @@ __Author__ = "Greg J. Badros <badros@gmail.com>"
 __copyright__ = "Copyright 2019, Greg J. Badros"
 
 from time import (localtime, mktime)
+from io import BytesIO
 import logging
-import threading
-import re
-import json
+import pycurl
 import requests
 
 # urllib.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -38,6 +37,7 @@ def xml_escape(s):
     answer = answer.replace("&", "&amp;")
     return answer
 
+
 def _t(root, name):
     """Return the element named NAME's text or None."""
     e = root.find(name)
@@ -45,12 +45,14 @@ def _t(root, name):
         return None
     return e.text
 
+
 def _i(root, name):
     """Return the element named NAME's text as an int/10 or None."""
     e = root.find(name)
     if e is None:
         return None
-    return int(e.text)/10
+    return int(e.text) / 10
+
 
 class WattBox:
     """Main WattBox class.
@@ -58,8 +60,6 @@ class WattBox:
     This object owns the connection to the wattbox power strip, handles
     reading status, and issuing state changes.
     """
-
-
 
     def parse(self, xml_str):
         """Main entrypoint into the parser. It gets the state of the strip."""
@@ -108,7 +108,7 @@ class WattBox:
         url = 'http://{h}/wattbox_info.xml'.format(h=self._host)
         try:
             response = requests.get(url, auth=(self._username, self._password),
-                                    verify=False)
+                                    verify=False, stream=True)
         except requests.exceptions.ConnectionError as e:
             _LOGGER.warning("Could not load_xml from wattbox at %s - error %s", url, e)
             raise
@@ -160,7 +160,7 @@ class WattBox:
             if not self._noop_set_state:
                 response = requests.get(url,
                                         auth=(self._username, self._password),
-                                        verify=False)
+                                        verify=False, stream=True)
                 xml_str = response.text
             else:
                 _LOGGER.info("Not actually making request to wattbox host (noop_set_state)")
@@ -178,10 +178,11 @@ class WattBox:
 class Switch:
     """Wattbox Switch represents a single IP-controlled outlet
     that can be turned on or off."""
+
     def __init__(self, wattbox, offset, name, on):
         self._wattbox = wattbox
         self._outlet_num = offset + 1
-        self._name = '{n} [{num}]'.format(n=name, num=offset+1)
+        self._name = '{n} [{num}]'.format(n=name, num=offset + 1)
         self._on = on
 
     @property
@@ -218,24 +219,54 @@ class Switch:
     def set_state(self, turn_on):
         """Set the state of the switch to on iff turn_on is True."""
         cmd = "1" if turn_on else "0"
+        response = self._send_command(cmd)
+        self._on = turn_on
+        _LOGGER.debug("Wattbox responded '%s'", response)
+
+    def cycle_power(self, force_on=False):
+        if force_on and self._on is False:
+            self.set_state(True)
+        else:
+            self._send_command("3")
+
+    def _send_command(self, cmd):
         current_time = '%d999' % (mktime(localtime()))
         url = 'http://{h}/control.cgi?outlet={o}&command={c}&time={t}'.format(
             h=self._wattbox._host, o=self._outlet_num, c=cmd, t=current_time)
         _LOGGER.debug("Sending wattbox %s url %s",
                       self._wattbox._hostname, url)
         if not self._wattbox._noop_set_state:
+            # Hacking in a workaround by using pycurl. Currently, if the wait time for power up on
+            # an outlets is >5 seconds, the server sends a non-RFC-compliant chunked response that
+            # blows up `urllib3`.  Without hacking into that and/or `requests`, it was an impossible
+            # exception to catch
+
+            buffer = BytesIO()
+            c = pycurl.Curl()
+            c.setopt(pycurl.WRITEDATA, buffer)
+            c.setopt(pycurl.HTTPAUTH, pycurl.HTTPAUTH_BASIC)
+            c.setopt(pycurl.USERPWD, "{}:{}".format(self._wattbox._username, self._wattbox._password))
+            c.setopt(pycurl.URL, url)
             try:
-                response = requests.get(url, auth=(self._wattbox._username,
-                                                   self._wattbox._password),
-                                        verify=False)
-            except requests.exceptions.ConnectionError as e:
-                _LOGGER.warning("Could not reach wattbox at %s - error %s", url, e)
-                return
-            self._update(response.text)
+                c.perform()
+            except pycurl.error:
+                pass
+            body = buffer.getvalue()
+            response = body.decode('iso-8859-1')
+            self._update(response)
+            return response
+
+            # try:
+            #     response = requests.get(url, auth=(self._wattbox._username,
+            #                                        self._wattbox._password),
+            #                             verify=False)
+            # except requests.exceptions.ConnectionError as e:
+            #     _LOGGER.warning("Could not reach wattbox at %s - error %s", url, e)
+            #     return
+            # self._update(response.text)
+            # return response.text
         else:
             _LOGGER.info("Not actually making request to wattbox host (noop_set_state)")
-        self._on = turn_on
-        _LOGGER.debug("Wattbox responded '%s'", response.text)
 
     def _update(self, response_text=None):
         old_on = self._on
